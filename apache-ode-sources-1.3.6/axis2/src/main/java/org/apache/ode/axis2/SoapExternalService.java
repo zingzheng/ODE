@@ -19,6 +19,7 @@
 
 package org.apache.ode.axis2;
 
+import org.apache.ode.axis2.hooks.ODEAxisServiceDispatcher;
 import org.apache.axiom.soap.SOAPEnvelope;
 import org.apache.axis2.AxisFault;
 import org.apache.axis2.addressing.EndpointReference;
@@ -104,9 +105,13 @@ public class SoapExternalService implements ExternalService {
     private ProcessConf _pconf;
     private ClusterUrlTransformer _clusterUrlTransformer;
     private String endpointUrl;
+	
+	
+	private boolean replace;
 
     public SoapExternalService(ProcessConf pconf, QName serviceName, String portName, ExecutorService executorService,
                                AxisConfiguration axisConfig, Scheduler sched, BpelServer server, MultiThreadedHttpConnectionManager connManager, ClusterUrlTransformer clusterUrlTransformer) throws AxisFault {
+		replace = false;					   
         _definition = pconf.getDefinitionForService(serviceName);
         _serviceName = serviceName;
         _portName = portName;
@@ -135,7 +140,7 @@ public class SoapExternalService implements ExternalService {
     }
 
 
-    public void invoke(final PartnerRoleMessageExchange odeMex) {
+	 public void invoke(final PartnerRoleMessageExchange odeMex) {
         boolean isTwoWay = odeMex.getMessageExchangePattern() == org.apache.ode.bpel.iapi.MessageExchange.MessageExchangePattern.REQUEST_RESPONSE;
         try {
 
@@ -170,11 +175,13 @@ public class SoapExternalService implements ExternalService {
             
             
             axisEPR.setAddress(_clusterUrlTransformer.rewriteOutgoingClusterURL(axisEPR.getAddress()));
-
-            if (__log.isDebugEnabled()) {
-                __log.debug("Axis2 sending message to " + axisEPR.getAddress() + " using MEX " + odeMex);
-                __log.debug("Message: " + soapEnv);
-            }
+			
+			if (replace==true){
+				//if last time it failed,replace the service
+				axisEPR =  replaceService(axisEPR);
+			}
+            __log.info("-------------------Axis2 sending message to: " + axisEPR.getAddress() + " using MEX: " + odeMex);
+			__log.info("-------------------Message: " + soapEnv);
 
             final OperationClient operationClient = client.createClient(isTwoWay ? ServiceClient.ANON_OUT_IN_OP
                     : ServiceClient.ANON_OUT_ONLY_OP);
@@ -187,80 +194,145 @@ public class SoapExternalService implements ExternalService {
 
             operationOptions.setAction(mctx.getSoapAction());
             operationOptions.setTo(axisEPR);
+			
+			if(replace == false){
+				__log.info("-------------first time try to invoke");
+			}else{
+				__log.info("-------------second time try to invoke");
+			}
+			
+			boolean goon = true;
+			if(replace == false && axisEPR.getAddress().contains("localhost")){
+				//first time to invoke localhost
+				//check whether the  service exist
+				__log.info("-------------check in localhost");
+				try{
+					ODEAxisServiceDispatcher dispatcher = new ODEAxisServiceDispatcher();
+					AxisService axisService = dispatcher.findService(mctx);
+					if (axisService == null){
+						__log.info("-------------there is no such service in localhost.");
+						replace = true;
+						goon = false;
+						invoke(odeMex);
+					}
+				}catch(AxisFault e){
+					__log.info("-------------there is no such service in localhost.");
+					replace = true;
+					goon = false;
+					invoke(odeMex);
+				}
+			}
+			
+			if(goon){	
+				if (isTwoWay ) {
+					final String mexId = odeMex.getMessageExchangeId();
+					final Operation operation = odeMex.getOperation();
 
-            if (isTwoWay) {
-                final String mexId = odeMex.getMessageExchangeId();
-                final Operation operation = odeMex.getOperation();
+					// Defer the invoke until the transaction commits.
+					_sched.registerSynchronizer(new Scheduler.Synchronizer() {
+						public void afterCompletion(boolean success) {
+							// If the TX is rolled back, then we don't send the request.
+							if (!success) return;
 
-                // Defer the invoke until the transaction commits.
-                _sched.registerSynchronizer(new Scheduler.Synchronizer() {
-                    public void afterCompletion(boolean success) {
-                        // If the TX is rolled back, then we don't send the request.
-                        if (!success) return;
+							// The invocation must happen in a separate thread, holding on the afterCompletion
+							// blocks other operations that could have been listed there as well.
+							_executorService.submit(new Callable<Object>() {
+								public Object call() throws Exception {
+									try {
+										operationClient.execute(true);
+										MessageContext response = operationClient.getMessageContext(WSDLConstants.MESSAGE_LABEL_IN_VALUE);
+										MessageContext flt = operationClient.getMessageContext(WSDLConstants.MESSAGE_LABEL_FAULT_VALUE);
+										if (response != null && __log.isDebugEnabled())
+											__log.debug("Service response:\n" + response.getEnvelope().toString());
 
-                        // The invocation must happen in a separate thread, holding on the afterCompletion
-                        // blocks other operations that could have been listed there as well.
-                        _executorService.submit(new Callable<Object>() {
-                            public Object call() throws Exception {
-                                try {
-                                    operationClient.execute(true);
-                                    MessageContext response = operationClient.getMessageContext(WSDLConstants.MESSAGE_LABEL_IN_VALUE);
-                                    MessageContext flt = operationClient.getMessageContext(WSDLConstants.MESSAGE_LABEL_FAULT_VALUE);
-                                    if (response != null && __log.isDebugEnabled())
-                                        __log.debug("Service response:\n" + response.getEnvelope().toString());
+										if (flt != null) {
+											reply(mexId, operation, flt, true);
+										} else {
+											reply(mexId, operation, response, response.isFault());
+										}
+									} catch (Throwable t) {
+										String errmsg = "Error sending message (mex=" + odeMex + "): " + t.getMessage();
+										//__log.error(errmsg, t);
+										__log.info(errmsg);
+										if (replace == false){
+											//replace==false,first time failed,retry
+											replace = true;
+											invoke(odeMex);
+										}else{
+											//replace==true : second time failed,do not retry
+											replyWithFailure(mexId, MessageExchange.FailureType.COMMUNICATION_ERROR, errmsg);
+										}
+										
+									} finally {
+										// release the HTTP connection, we don't need it anymore
+										TransportOutDescription out = mctx.getTransportOut();
+										if (out != null && out.getSender() != null) {
+											out.getSender().cleanup(mctx);
+										}
+									}
+									return null;
+								}
+							});
+						}
 
-                                    if (flt != null) {
-                                        reply(mexId, operation, flt, true);
-                                    } else {
-                                        reply(mexId, operation, response, response.isFault());
-                                    }
-                                } catch (Throwable t) {
-                                    String errmsg = "Error sending message (mex=" + odeMex + "): " + t.getMessage();
-                                    __log.error(errmsg, t);
-                                    replyWithFailure(mexId, MessageExchange.FailureType.COMMUNICATION_ERROR, errmsg);
-                                } finally {
-                                    // release the HTTP connection, we don't need it anymore
-                                    TransportOutDescription out = mctx.getTransportOut();
-                                    if (out != null && out.getSender() != null) {
-                                        out.getSender().cleanup(mctx);
-                                    }
-                                }
-                                return null;
-                            }
-                        });
-                    }
+						public void beforeCompletion() {
+						}
+					});
+					odeMex.replyAsync();
 
-                    public void beforeCompletion() {
-                    }
-                });
-                odeMex.replyAsync();
-
-            } else { /** one-way case * */
-                _executorService.submit(new Callable<Object>() {
-                    public Object call() throws Exception {
-                        try {
-                            operationClient.execute(true);
-                        } catch (Throwable t) {
-                            String errmsg = "Error sending message (mex=" + odeMex + "): " + t.getMessage();
-                            __log.error(errmsg, t);
-                        } finally {
-                            // release the HTTP connection, we don't need it anymore
-                            TransportOutDescription out = mctx.getTransportOut();
-                            if (out != null && out.getSender() != null) {
-                                out.getSender().cleanup(mctx);
-                            }
-                        }
-                        return null;
-                    }
-                });
-                odeMex.replyOneWayOk();
-            }
+				} else { /** one-way case * */
+					_executorService.submit(new Callable<Object>() {
+						public Object call() throws Exception {
+							try {
+								operationClient.execute(true);
+							} catch (Throwable t) {
+								String errmsg = "Error sending message (mex=" + odeMex + "): " + t.getMessage();
+								//__log.error(errmsg, t);
+								__log.info(errmsg);
+								if (replace == false){
+									//replace==false,first time failed,retry
+									replace = true;
+									invoke(odeMex);
+								}else{
+									//replace==true : second time failed,do not retry
+									//one-way do nothing
+											
+								}
+							} finally {
+								// release the HTTP connection, we don't need it anymore
+								TransportOutDescription out = mctx.getTransportOut();
+								if (out != null && out.getSender() != null) {
+									out.getSender().cleanup(mctx);
+								}
+							}
+							return null;
+						}
+					});
+					odeMex.replyOneWayOk();
+				}
+			}
         } catch (Throwable t) {
             String errmsg = "Error sending message to Axis2 for ODE mex " + odeMex;
             __log.error(errmsg, t);
             odeMex.replyWithFailure(MessageExchange.FailureType.COMMUNICATION_ERROR, errmsg, null);
         }
     }
+	
+    
+	
+	private EndpointReference replaceService(EndpointReference axisEPR){
+		String oldAddress = axisEPR.getAddress();
+        String baseAddress = "http://10.109.19.127:8080";
+        String[] addressPart = oldAddress.split("/");
+        String newAddress = baseAddress;
+        for(int l=3;l<addressPart.length;l++){
+            newAddress = newAddress+"/"+addressPart[l];
+        }
+
+        __log.info("-----------soap address replace from: "+oldAddress+" to: "+newAddress);
+        axisEPR.setAddress(newAddress);
+		return axisEPR;
+	}
 
     private ServiceClient getServiceClient() throws AxisFault {
         try {
