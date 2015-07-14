@@ -97,5 +97,10 @@ public interface PartnerRoleMessageExchange extends MessageExchange {
   EndpointReference getMyRoleEndpointReference();
 
 
+  /**
+   * in order to retry 
+   * @param status [description]
+   */
+  void setStatus(Status status);
 
 }

@@ -69,6 +69,10 @@ public class PartnerRoleMessageExchangeImpl extends MessageExchangeImpl implemen
         setStatus(Status.ASYNC);
     }
 
+    public void setStatus(Status status){
+        super.setStatus(status);
+    }
+
     public void replyWithFault(QName faultType, Message outputFaultMessage) throws BpelEngineException {
         if (LOG.isDebugEnabled()) {
             LOG.debug("replyWithFault mex=" + getMessageExchangeId());
