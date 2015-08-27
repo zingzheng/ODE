@@ -85,6 +85,12 @@ abstract class MessageExchangeImpl implements MessageExchange {
         return getDAO().getOperation();
     }
 
+    //add by zss
+    public void setOperationName(String opname){
+        getDAO().setOperation(opname);
+
+    }
+
     public MessageExchangePattern getMessageExchangePattern() {
         return MessageExchangePattern.valueOf(getDAO().getPattern());
     }

@@ -121,6 +121,9 @@ public interface MessageExchange {
     String getOperationName()
             throws BpelEngineException;
 
+    //add by zss
+    void setOperationName(String opname);
+
 
     /**
      * Get a reference to the end-point targeted by this message exchange.

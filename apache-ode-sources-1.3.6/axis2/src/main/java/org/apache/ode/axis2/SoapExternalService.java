@@ -78,6 +78,7 @@ import java.io.BufferedReader;
 import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.InputStreamReader;
+import java.util.Vector;
 
 /**
  * Acts as a service not provided by ODE. Used mainly for invocation as a way to maintain the WSDL description of used
@@ -112,12 +113,12 @@ public class SoapExternalService implements ExternalService {
     private String endpointUrl;
 	
 	
-	private boolean replace;
+
 
 
     public SoapExternalService(ProcessConf pconf, QName serviceName, String portName, ExecutorService executorService,
                                AxisConfiguration axisConfig, Scheduler sched, BpelServer server, MultiThreadedHttpConnectionManager connManager, ClusterUrlTransformer clusterUrlTransformer) throws AxisFault {
-		replace = false;				   
+						   
         _definition = pconf.getDefinitionForService(serviceName);
         _serviceName = serviceName;
         _portName = portName;
@@ -151,7 +152,9 @@ public class SoapExternalService implements ExternalService {
         boolean isTwoWay = odeMex.getMessageExchangePattern() == org.apache.ode.bpel.iapi.MessageExchange.MessageExchangePattern.REQUEST_RESPONSE;
         try {
 
+            //对于two-way模式，需要记录原来状态，并在重试时恢复该状态
             final MessageExchange.Status o_status = odeMex.getStatus();
+
             ServiceClient client = getServiceClient();
 
             // Override options are passed to the axis MessageContext so we can
@@ -183,18 +186,47 @@ public class SoapExternalService implements ExternalService {
             
             
             axisEPR.setAddress(_clusterUrlTransformer.rewriteOutgoingClusterURL(axisEPR.getAddress()));
-			
-            if(replace == false){
-                __log.info("-------------first time try to invoke");
-            }else{
-                //if last time it failed,replace the service
-                odeMex.setStatus(o_status);
-                axisEPR =  replaceService(axisEPR);
-                __log.info("-------------second time try to invoke");
-            }
+
 
             __log.info("-------------------Axis2 sending message to: " + axisEPR.getAddress() + " using MEX: " + odeMex);
-			__log.info("-------------------Message: " + soapEnv);
+            __log.info("-------------------Message: " + soapEnv);
+
+
+
+            //主动适变
+            if(axisEPR.getAddress().contains("SLG")){
+                __log.info("--------------SLG ing");
+                boolean goon = replaceService(axisEPR,odeMex.getOperationName());
+                if (isTwoWay && !goon){
+                    isTwoWay = false;
+                }
+
+                __log.info("-------------------Axis2 sending message to: " + axisEPR.getAddress() + " using MEX: " + odeMex);
+                __log.info("-------------------Message: " + soapEnv);
+            }			
+
+            //被动适变-本地
+            //invoke本地服务，先在本地查询
+            if(axisEPR.getAddress().contains("localhost") && axisEPR.getAddress().contains("ode")){
+                __log.info("-------------check in localhost");
+                try{
+                    ODEAxisServiceDispatcher dispatcher = new ODEAxisServiceDispatcher();
+                    AxisService axisService = dispatcher.findService(mctx);
+                    if (axisService == null){
+                        __log.info("-------------there is no such service in localhost.");
+                        replaceService(axisEPR,odeMex.getOperationName());
+                    }
+                }catch(AxisFault e){
+                    __log.info("-------------there is something wrong when checking in localhost.");
+                }
+
+                __log.info("-------------------Axis2 sending message to: " + axisEPR.getAddress() + " using MEX: " + odeMex);
+                __log.info("-------------------Message: " + soapEnv);
+            }
+
+
+
+            
 
             final OperationClient operationClient = client.createClient(isTwoWay ? ServiceClient.ANON_OUT_IN_OP
                     : ServiceClient.ANON_OUT_ONLY_OP);
@@ -209,197 +241,173 @@ public class SoapExternalService implements ExternalService {
             operationOptions.setTo(axisEPR);
 			
 
-			boolean goon = true;
-			if(replace == false && axisEPR.getAddress().contains("localhost") && axisEPR.getAddress().contains("ode")){
-				//first time to invoke localhost
-				//check whether the  service exist
-				__log.info("-------------check in localhost");
-				try{
-					ODEAxisServiceDispatcher dispatcher = new ODEAxisServiceDispatcher();
-					AxisService axisService = dispatcher.findService(mctx);
-					if (axisService == null){
-						__log.info("-------------there is no such service in localhost.");
-						replace = true;
-						goon = false;
-						invoke(odeMex);
-					}
-				}catch(AxisFault e){
-					__log.info("-------------there is no such service in localhost.");
-					replace = true;
-					goon = false;
-					invoke(odeMex);
-				}
-			}
 			
-			if(goon){	
-				if (isTwoWay ) {
-					final String mexId = odeMex.getMessageExchangeId();
-					final Operation operation = odeMex.getOperation();
+				
+			if (isTwoWay ) {
+				final String mexId = odeMex.getMessageExchangeId();
+				final Operation operation = odeMex.getOperation();
 
-					// Defer the invoke until the transaction commits.
-					_sched.registerSynchronizer(new Scheduler.Synchronizer() {
-						public void afterCompletion(boolean success) {
-							// If the TX is rolled back, then we don't send the request.
-							if (!success) return;
+				// Defer the invoke until the transaction commits.
+				_sched.registerSynchronizer(new Scheduler.Synchronizer() {
+					public void afterCompletion(boolean success) {
+						// If the TX is rolled back, then we don't send the request.
+						if (!success) return;
 
-							// The invocation must happen in a separate thread, holding on the afterCompletion
-							// blocks other operations that could have been listed there as well.
-							_executorService.submit(new Callable<Object>() {
-								public Object call() throws Exception {
-									try {
-										operationClient.execute(true);
-										MessageContext response = operationClient.getMessageContext(WSDLConstants.MESSAGE_LABEL_IN_VALUE);
-										MessageContext flt = operationClient.getMessageContext(WSDLConstants.MESSAGE_LABEL_FAULT_VALUE);
-										if (response != null && __log.isDebugEnabled())
-											__log.debug("Service response:\n" + response.getEnvelope().toString());
+						// The invocation must happen in a separate thread, holding on the afterCompletion
+						// blocks other operations that could have been listed there as well.
+						_executorService.submit(new Callable<Object>() {
+							public Object call() throws Exception {
+								try {
+									operationClient.execute(true);
+									MessageContext response = operationClient.getMessageContext(WSDLConstants.MESSAGE_LABEL_IN_VALUE);
+									MessageContext flt = operationClient.getMessageContext(WSDLConstants.MESSAGE_LABEL_FAULT_VALUE);
+									if (response != null && __log.isDebugEnabled())
+										__log.debug("Service response:\n" + response.getEnvelope().toString());
 
-										if (flt != null) {
-											reply(mexId, operation, flt, true);
-										} else {
-											reply(mexId, operation, response, response.isFault());
-										}
-									} catch (Throwable t) {
-                                        
-										String emsg = "Error sending message (mex=" + odeMex + "): " + t.getMessage();
-										//__log.error(errmsg, t);
-										__log.info(emsg);
-                                        /*
-										if (replace == false){
-											//replace==false,first time failed,retry
-                                            replace = true;
-											invoke(odeMex);
-										}else{
-											//replace==true : second time failed,do not retry
-											replyWithFailure(mexId, MessageExchange.FailureType.COMMUNICATION_ERROR, errmsg);
-										}*/
-                                        __log.info("----------------------two way retry ing:");
-                                        try{
-                                            odeMex.setStatus(o_status);
-                                            ServiceClient client2 = getServiceClient();
-                                            MessageContext mctx2 = new MessageContext();
-                                            mctx2.getOptions().setParent(client2.getOptions());
-                                            writeHeader(mctx2, odeMex);
-                                            _converter.createSoapRequest(mctx2, odeMex.getRequest(), odeMex.getOperation());
-                                            SOAPEnvelope soapEnv2 = mctx2.getEnvelope();
-                                            String mexEndpointUrl2 = ((MutableEndpoint) odeMex.getEndpointReference()).getUrl();
-                                            EndpointReference axisEPR2 = new EndpointReference(mexEndpointUrl2);
-                                            axisEPR2 =  replaceService(axisEPR2);
-                                            axisEPR2.setAddress(_clusterUrlTransformer.rewriteOutgoingClusterURL(axisEPR2.getAddress()));
-                                            __log.info("-------------------Axis2 sending message to: " + axisEPR2.getAddress() + " using MEX: " + odeMex);
-                                            OperationClient operationClient2 = client2.createClient(true ? ServiceClient.ANON_OUT_IN_OP
-                                                : ServiceClient.ANON_OUT_ONLY_OP);
-                                            operationClient2.addMessageContext(mctx2);
-                                            Options operationOptions2 = operationClient2.getOptions();
-                                            AuthenticationHelper.setHttpAuthentication(odeMex, operationOptions2);
-                                            operationOptions2.setAction(mctx2.getSoapAction());
-                                            operationOptions2.setTo(axisEPR2);
-                                            String mexId2 = odeMex.getMessageExchangeId();
-                                            Operation operation2 = odeMex.getOperation();
-
-                                            try{
-                                                operationClient2.execute(true);
-                                                MessageContext response2 = operationClient2.getMessageContext(WSDLConstants.MESSAGE_LABEL_IN_VALUE);
-                                                MessageContext flt2 = operationClient2.getMessageContext(WSDLConstants.MESSAGE_LABEL_FAULT_VALUE);
-                                                if (response2 != null && __log.isDebugEnabled())
-                                                    __log.debug("Service response:\n" + response2.getEnvelope().toString());
-
-                                                if (flt2 != null) {
-                                                    reply(mexId2, operation2, flt2, true);
-                                                } else {
-                                                    reply(mexId2, operation2, response2, response2.isFault());
-                                                }
-                                            }catch(Throwable tt){
-                                                String errmsg = "Error sending message (mex=" + odeMex + "): " + tt.getMessage();
-                                                __log.error(errmsg, tt);
-                                                replyWithFailure(mexId2, MessageExchange.FailureType.COMMUNICATION_ERROR, errmsg);
-                                            }finally{
-                                                TransportOutDescription out2 = mctx2.getTransportOut();
-                                                if (out2 != null && out2.getSender() != null){
-                                                out2.getSender().cleanup(mctx2);
-                                                }
-                                            }
-                                        }catch(Throwable f){
-                                            __log.info("two way retry init  error");
-                                        }
-                                        
-									} finally {
-										// release the HTTP connection, we don't need it anymore
-										TransportOutDescription out = mctx.getTransportOut();
-										if (out != null && out.getSender() != null) {
-											out.getSender().cleanup(mctx);
-										}
+									if (flt != null) {
+										reply(mexId, operation, flt, true);
+									} else {
+										reply(mexId, operation, response, response.isFault());
 									}
-									return null;
-								}
-							});
-						}
-
-						public void beforeCompletion() {
-						}
-					});
-					odeMex.replyAsync();
-
-				} else { /** one-way case * */
-					_executorService.submit(new Callable<Object>() {
-						public Object call() throws Exception {
-							try {
-								operationClient.execute(true);
-							} catch (Throwable t) {
-								String emsg = "Error sending message (mex=" + odeMex + "): " + t.getMessage();
-								//__log.error(errmsg, t);
-								__log.info(emsg);
-								__log.info("----------------------one way retry ing:");
-                                try{
-                                    odeMex.setStatus(o_status);
-                                    ServiceClient client2 = getServiceClient();
-                                    MessageContext mctx2 = new MessageContext();
-                                    mctx2.getOptions().setParent(client2.getOptions());
-                                    writeHeader(mctx2, odeMex);
-                                    _converter.createSoapRequest(mctx2, odeMex.getRequest(), odeMex.getOperation());
-                                    SOAPEnvelope soapEnv2 = mctx2.getEnvelope();
-                                    String mexEndpointUrl2 = ((MutableEndpoint) odeMex.getEndpointReference()).getUrl();
-                                    EndpointReference axisEPR2 = new EndpointReference(mexEndpointUrl2);
-                                    axisEPR2 =  replaceService(axisEPR2);
-                                    axisEPR2.setAddress(_clusterUrlTransformer.rewriteOutgoingClusterURL(axisEPR2.getAddress()));
-                                    __log.info("-------------------Axis2 sending message to: " + axisEPR2.getAddress() + " using MEX: " + odeMex);
-                                    OperationClient operationClient2 = client2.createClient(false ? ServiceClient.ANON_OUT_IN_OP
-                                            : ServiceClient.ANON_OUT_ONLY_OP);
-                                    operationClient2.addMessageContext(mctx2);
-                                    Options operationOptions2 = operationClient2.getOptions();
-                                    AuthenticationHelper.setHttpAuthentication(odeMex, operationOptions2);
-                                    operationOptions2.setAction(mctx2.getSoapAction());
-                                    operationOptions2.setTo(axisEPR2);
+								} catch (Throwable t) {
+                                    
+                                    //第一次invoke失败
+									String emsg = "Error sending message (mex=" + odeMex + "): " + t.getMessage();
+									__log.info(emsg);
+                                    __log.info("----------------------two way retry ing:");
+                                    //第二次尝试准备
                                     try{
+                                        odeMex.setStatus(o_status);
+                                        ServiceClient client2 = getServiceClient();
+                                        MessageContext mctx2 = new MessageContext();
+                                        mctx2.getOptions().setParent(client2.getOptions());
+                                        writeHeader(mctx2, odeMex);
+                                        _converter.createSoapRequest(mctx2, odeMex.getRequest(), odeMex.getOperation());
+                                        SOAPEnvelope soapEnv2 = mctx2.getEnvelope();
+                                        String mexEndpointUrl2 = ((MutableEndpoint) odeMex.getEndpointReference()).getUrl();
+                                        EndpointReference axisEPR2 = new EndpointReference(mexEndpointUrl2);
+                                        
+                                        replaceService(axisEPR2,odeMex.getOperationName());
+                                        
+                                        __log.info("-------------------Axis2 sending message to: " + axisEPR2.getAddress() + " using MEX: " + odeMex);
+                                        
+                                        OperationClient operationClient2 = client2.createClient(true ? ServiceClient.ANON_OUT_IN_OP
+                                            : ServiceClient.ANON_OUT_ONLY_OP);
+                                        operationClient2.addMessageContext(mctx2);
+                                        Options operationOptions2 = operationClient2.getOptions();
+                                        AuthenticationHelper.setHttpAuthentication(odeMex, operationOptions2);
+                                        operationOptions2.setAction(mctx2.getSoapAction());
+                                        operationOptions2.setTo(axisEPR2);
+                                        String mexId2 = odeMex.getMessageExchangeId();
+                                        Operation operation2 = odeMex.getOperation();
+
+                                        //第二次invoke
+                                        try{
                                             operationClient2.execute(true);
-                                            
-                                    }catch(Throwable tt){
+                                            MessageContext response2 = operationClient2.getMessageContext(WSDLConstants.MESSAGE_LABEL_IN_VALUE);
+                                            MessageContext flt2 = operationClient2.getMessageContext(WSDLConstants.MESSAGE_LABEL_FAULT_VALUE);
+                                            if (response2 != null && __log.isDebugEnabled())
+                                                __log.debug("Service response:\n" + response2.getEnvelope().toString());
+
+                                            if (flt2 != null) {
+                                                reply(mexId2, operation2, flt2, true);
+                                            } else {
+                                                reply(mexId2, operation2, response2, response2.isFault());
+                                            }
+                                        }catch(Throwable tt){
+                                            //第二次invoke失败
                                             String errmsg = "Error sending message (mex=" + odeMex + "): " + tt.getMessage();
                                             __log.error(errmsg, tt);
-                                            
-                                    }finally{
-                                        TransportOutDescription out2 = mctx2.getTransportOut();
-                                        if (out2 != null && out2.getSender() != null){
+                                            replyWithFailure(mexId2, MessageExchange.FailureType.COMMUNICATION_ERROR, errmsg);
+                                        }finally{
+                                            TransportOutDescription out2 = mctx2.getTransportOut();
+                                            if (out2 != null && out2.getSender() != null){
                                             out2.getSender().cleanup(mctx2);
+                                            }
                                         }
+                                    }catch(Throwable f){
+                                        __log.info("two way retry init  error");
                                     }
-                                }catch(Throwable f){
-                                    __log.info("one way retry init  error");
-                                }
-
-
-							} finally {
-								// release the HTTP connection, we don't need it anymore
-								TransportOutDescription out = mctx.getTransportOut();
-								if (out != null && out.getSender() != null) {
-									out.getSender().cleanup(mctx);
+                                    
+								} finally {
+									// release the HTTP connection, we don't need it anymore
+									TransportOutDescription out = mctx.getTransportOut();
+									if (out != null && out.getSender() != null) {
+										out.getSender().cleanup(mctx);
+									}
 								}
+								return null;
 							}
-							return null;
+						});
+					}
+
+					public void beforeCompletion() {
+					}
+				});
+				odeMex.replyAsync();
+
+			} else { /** one-way case * */
+				_executorService.submit(new Callable<Object>() {
+					public Object call() throws Exception {
+						try {
+							operationClient.execute(true);
+						} catch (Throwable t) {
+							String emsg = "Error sending message (mex=" + odeMex + "): " + t.getMessage();
+							//__log.error(errmsg, t);
+							__log.info(emsg);
+							__log.info("----------------------one way retry ing:");
+                            try{
+                                odeMex.setStatus(o_status);
+                                ServiceClient client2 = getServiceClient();
+                                MessageContext mctx2 = new MessageContext();
+                                mctx2.getOptions().setParent(client2.getOptions());
+                                writeHeader(mctx2, odeMex);
+                                _converter.createSoapRequest(mctx2, odeMex.getRequest(), odeMex.getOperation());
+                                SOAPEnvelope soapEnv2 = mctx2.getEnvelope();
+                                String mexEndpointUrl2 = ((MutableEndpoint) odeMex.getEndpointReference()).getUrl();
+                                EndpointReference axisEPR2 = new EndpointReference(mexEndpointUrl2);
+                                
+                                replaceService(axisEPR2,odeMex.getOperationName());
+                                
+                                __log.info("-------------------Axis2 sending message to: " + axisEPR2.getAddress() + " using MEX: " + odeMex);
+                                OperationClient operationClient2 = client2.createClient(false ? ServiceClient.ANON_OUT_IN_OP
+                                        : ServiceClient.ANON_OUT_ONLY_OP);
+                                operationClient2.addMessageContext(mctx2);
+                                Options operationOptions2 = operationClient2.getOptions();
+                                AuthenticationHelper.setHttpAuthentication(odeMex, operationOptions2);
+                                operationOptions2.setAction(mctx2.getSoapAction());
+                                operationOptions2.setTo(axisEPR2);
+                                try{
+                                        operationClient2.execute(true);
+                                        
+                                }catch(Throwable tt){
+                                        String errmsg = "Error sending message (mex=" + odeMex + "): " + tt.getMessage();
+                                        __log.error(errmsg, tt);
+                                        
+                                }finally{
+                                    TransportOutDescription out2 = mctx2.getTransportOut();
+                                    if (out2 != null && out2.getSender() != null){
+                                        out2.getSender().cleanup(mctx2);
+                                    }
+                                }
+                            }catch(Throwable f){
+                                __log.info("one way retry init  error");
+                            }
+
+
+						} finally {
+							// release the HTTP connection, we don't need it anymore
+							TransportOutDescription out = mctx.getTransportOut();
+							if (out != null && out.getSender() != null) {
+								out.getSender().cleanup(mctx);
+							}
 						}
-					});
-					odeMex.replyOneWayOk();
-				}
+						return null;
+					}
+				});
+				odeMex.replyOneWayOk();
 			}
+			
         } catch (Throwable t) {
             String errmsg = "Error sending message to Axis2 for ODE mex " + odeMex;
             __log.error(errmsg, t);
@@ -409,34 +417,34 @@ public class SoapExternalService implements ExternalService {
 	
     
 	
-	private static EndpointReference replaceService(EndpointReference axisEPR){
+	private static boolean replaceService(EndpointReference axisEPR, String oldOp){
 		String oldAddress = axisEPR.getAddress();
-        String newAddress = SLG(oldAddress);
-        /*
-        String baseAddress = "http://10.109.19.127:8080";
-        String[] addressPart = oldAddress.split("/");
-        String newAddress = baseAddress;
-        for(int l=3;l<addressPart.length;l++){
-            newAddress = newAddress+"/"+addressPart[l];
-        }
-        */
-        __log.info("-----------soap address replace from: "+oldAddress+" to: "+newAddress);
+        Vector v = SLG(oldAddress,oldOp);
+        String newAddress = (String)v.get(0);
+        String newOp = (String)v.get(1);
+        String goon = (String)v.get(2);
+
+        __log.info("-----------soap address replace from: "+oldAddress+" : "+oldOp+" to: "+newAddress+" : "+newOp);
         axisEPR.setAddress(newAddress);
-		return axisEPR;
+        return goon.equals("true");
 	}
 
 
-    private static String SLG(String replaceIp){
+    private static Vector SLG(String replaceIp, String replaceOp){
 
+        Vector v = new Vector();
         String filePath = System.getProperty("user.dir")+"/SLG.txt";
         __log.info("-------trying to get replace from SLG:"+filePath);
         try {
             BufferedReader br = new BufferedReader(new InputStreamReader(
                     new FileInputStream(filePath)));
             for(String line = br.readLine();line!=null;line=br.readLine()){
-                String[] ip = line.split(" ");
-                if(ip[0].equals(replaceIp)){
-                    return ip[1];
+                String[] s = line.split(" ");
+                if(s[0].equals(replaceIp) && s[1].equals(replaceOp)){
+                    v.add(s[2]);
+                    v.add(s[3]);
+                    v.add(s[4]);
+                    return v;
                 }
             }
         } catch (FileNotFoundException e) {
@@ -444,7 +452,10 @@ public class SoapExternalService implements ExternalService {
         } catch (IOException e) {
             __log.info("read error");
         }
-        return replaceIp;
+        v.add(replaceIp);
+        v.add(replaceOp);
+        v.add("true");
+        return v;
     }
 
 
