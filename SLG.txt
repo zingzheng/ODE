@@ -1,0 +1,4 @@
+http://10.109.247.3:8080/webServiceProj/services/AddService add http://10.109.19.127:8080/webServiceProject/services/AddService add true
+http://localhost:8080/webServiceProj/services/AddService add http://10.109.19.127:8080/webServiceProject/services/AddService add true
+http://10.109.247.88:8080/axis/services/xxx54_ThirdPartyCall makeCall http://10.109.19.127:8080/axis/services/xxx54_ThirdPartyCall makeCall true
+http://SLG/axis/services/xxx54_ThirdPartyCall makeCall http://10.109.19.127:8080/axis/services/xxx54_ThirdPartyCall makeCall false
